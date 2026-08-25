@@ -2931,6 +2931,9 @@ fn cell_data_from_style(symbol: String, style: Style) -> CellData {
         fg: crate::protocol::color_to_u32(style.fg.unwrap_or(Color::Reset)),
         bg: crate::protocol::color_to_u32(style.bg.unwrap_or(Color::Reset)),
         modifier: crate::protocol::modifier_to_u16(style.add_modifier),
+        underline_color: crate::protocol::color_to_u32(
+            style.underline_color.unwrap_or(Color::Reset),
+        ),
         skip: false,
         hyperlink: None,
     }
@@ -6023,6 +6026,59 @@ mod tests {
         assert_eq!(
             crate::protocol::underline_style_from_modifier(frame.cells[0].modifier),
             3
+        );
+    }
+
+    #[test]
+    fn dirty_patch_preserves_underline_color() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
+            .unwrap();
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.terminal.write(b"\x1b[4:3m\x1b[58:2::255:0:0mU");
+        }
+
+        let patch = match pane.collect_dirty_patch(20, 5) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch,
+            other => panic!("expected dirty patch, got {other:?}"),
+        };
+
+        let cell = &patch.rows[0].1[0];
+        assert_eq!(cell.symbol, "U");
+        assert_eq!(
+            cell.underline_color,
+            crate::protocol::color_to_u32(Color::Rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn full_frame_preserves_underline_color() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.terminal.write(b"\x1b[4:3m\x1b[58:2::255:0:0mU");
+        }
+
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
+            .unwrap();
+
+        let frame =
+            crate::protocol::FrameData::from_ratatui_buffer(terminal.backend().buffer(), None);
+        assert_eq!(frame.cells[0].symbol, "U");
+        assert_eq!(
+            frame.cells[0].underline_color,
+            crate::protocol::color_to_u32(Color::Rgb(255, 0, 0))
         );
     }
 

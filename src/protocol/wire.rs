@@ -482,6 +482,8 @@ pub struct CellData {
     pub bg: u32,
     /// Bitmask of style modifiers (bold, italic, etc.) plus Herdr extension bits.
     pub modifier: u16,
+    /// Underline color as a packed u32, encoded like `fg` and `bg`.
+    pub underline_color: u32,
     /// Whether this cell should be skipped during diff-based rendering.
     pub skip: bool,
     /// Index into `FrameData::hyperlinks` for this cell's OSC 8 target, if any.
@@ -495,6 +497,7 @@ impl CellData {
             fg: color_to_u32(cell.fg),
             bg: color_to_u32(cell.bg),
             modifier: modifier_to_u16(cell.modifier),
+            underline_color: color_to_u32(cell.underline_color),
             skip: cell.skip,
             hyperlink: None,
         }
@@ -1403,6 +1406,17 @@ mod tests {
     }
 
     #[test]
+    fn from_ratatui_cell_preserves_underline_color() {
+        let mut cell = ratatui::buffer::Cell::default();
+        cell.underline_color = Color::Rgb(255, 0, 0);
+
+        assert_eq!(
+            CellData::from_ratatui_cell(&cell).underline_color,
+            color_to_u32(Color::Rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
     fn server_frame_roundtrip_nontrivial() {
         // Build a 3×2 frame with varied styles (≥2×2).
         let frame = FrameData {
@@ -1412,6 +1426,7 @@ mod tests {
                     fg: color_to_u32(Color::Red),
                     bg: color_to_u32(Color::Black),
                     modifier: Modifier::BOLD.bits(),
+                    underline_color: color_to_u32(Color::Rgb(255, 0, 0)),
                     skip: false,
                     hyperlink: None,
                 },
@@ -1420,6 +1435,7 @@ mod tests {
                     fg: color_to_u32(Color::Green),
                     bg: color_to_u32(Color::Reset),
                     modifier: Modifier::ITALIC.bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 },
@@ -1428,6 +1444,7 @@ mod tests {
                     fg: color_to_u32(Color::Rgb(255, 128, 0)),
                     bg: color_to_u32(Color::Indexed(220)),
                     modifier: (Modifier::BOLD | Modifier::UNDERLINED).bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: Some(0),
                 },
@@ -1436,6 +1453,7 @@ mod tests {
                     fg: color_to_u32(Color::Reset),
                     bg: color_to_u32(Color::Reset),
                     modifier: Modifier::empty().bits(),
+                    underline_color: 0,
                     skip: true,
                     hyperlink: None,
                 },
@@ -1444,6 +1462,7 @@ mod tests {
                     fg: color_to_u32(Color::Cyan),
                     bg: color_to_u32(Color::Blue),
                     modifier: Modifier::REVERSED.bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 },
@@ -1452,6 +1471,7 @@ mod tests {
                     fg: color_to_u32(Color::Yellow),
                     bg: color_to_u32(Color::Magenta),
                     modifier: Modifier::empty().bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 },
@@ -1684,6 +1704,7 @@ mod tests {
                 fg: color_to_u32(Color::Rgb((i % 256) as u8, ((i / 256) % 256) as u8, 128)),
                 bg: color_to_u32(Color::Indexed((i % 256) as u8)),
                 modifier: ((i % 16) as u16),
+                underline_color: 0,
                 skip: i % 100 == 0,
                 hyperlink: None,
             })
@@ -2034,6 +2055,7 @@ mod tests {
                     fg: 0,
                     bg: 0,
                     modifier: 0,
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 };
