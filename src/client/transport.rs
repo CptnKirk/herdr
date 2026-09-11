@@ -7,6 +7,7 @@ pub(super) fn start_endpoint_transport(
     endpoint_id: endpoint::ClientEndpointId,
     generation: u64,
     max_frame_size: usize,
+    surface_codec: crate::protocol::endpoint::SurfaceCodec,
 ) -> Result<endpoint::NativeEndpointTransport, ClientError> {
     let reader = stream.try_clone().map_err(ClientError::ConnectionFailed)?;
     let transport = endpoint::NativeEndpointTransport::with_lifetime(stream, lifetime)
@@ -21,6 +22,7 @@ pub(super) fn start_endpoint_transport(
                 event_tx,
                 &stopped,
                 max_frame_size,
+                surface_codec,
                 endpoint_id,
                 generation,
             );
@@ -35,6 +37,7 @@ pub(super) fn server_reader_thread(
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
     max_frame_size: usize,
+    surface_codec: crate::protocol::endpoint::SurfaceCodec,
     endpoint_id: endpoint::ClientEndpointId,
     generation: u64,
 ) {
@@ -55,7 +58,7 @@ pub(super) fn server_reader_thread(
             break;
         }
 
-        match protocol::read_message(&mut stream, max_frame_size) {
+        match protocol::read_server_message(&mut stream, max_frame_size, surface_codec) {
             Ok(msg) => {
                 if event_tx
                     .blocking_send(ClientLoopEvent::ServerMessage {

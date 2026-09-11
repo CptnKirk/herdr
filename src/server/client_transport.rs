@@ -395,6 +395,7 @@ pub(crate) enum ServerEvent {
         endpoint_keybindings: bool,
         mouse_capture: bool,
         surface_active: bool,
+        surface_codec: crate::protocol::endpoint::SurfaceCodec,
         writer: ClientWriter,
     },
     /// A client sent an input message.
@@ -760,6 +761,7 @@ pub(crate) fn handle_client_handshake(
                     hello.endpoint_keybindings,
                     hello.mouse_capture,
                     hello.surface_active,
+                    crate::protocol::endpoint::SurfaceCodec::negotiate(&hello.surface_codecs),
                 )),
             )
         }
@@ -800,13 +802,14 @@ pub(crate) fn handle_client_handshake(
     } else {
         RenderEncoding::TerminalAnsi
     };
-    let welcome = if shell_options.is_some() {
+    let welcome = if let Some((.., surface_codec)) = shell_options {
         let welcome = EndpointServerWelcome::compatible(
             crate::server::client_commands::supported_client_shell_method_names()
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
-        );
+        )
+        .with_surface_codec(surface_codec);
         ServerMessage::EndpointControl {
             kind: ENDPOINT_WELCOME_KIND.into(),
             data: serde_json::to_string(&welcome).map_err(io::Error::other)?,
@@ -854,6 +857,7 @@ pub(crate) fn handle_client_handshake(
         endpoint_keybindings,
         mouse_capture,
         surface_active,
+        surface_codec,
     )) = shell_options
     {
         ServerEvent::ClientShellConnected {
@@ -867,6 +871,7 @@ pub(crate) fn handle_client_handshake(
             endpoint_keybindings,
             mouse_capture,
             surface_active,
+            surface_codec,
             writer,
         }
     } else {
@@ -1796,6 +1801,83 @@ mod tests {
             .expect("handshake thread result");
     }
 
+    fn handshake_offering_surface_codecs(
+        surface_codecs: &[&str],
+    ) -> (
+        EndpointServerWelcome,
+        crate::protocol::endpoint::SurfaceCodec,
+    ) {
+        let (mut client_stream, server_stream, _path) = local_stream_pair("surface-codec");
+        let (server_event_tx, mut server_event_rx) = mpsc::channel(4);
+        let should_quit = Arc::new(AtomicBool::new(false));
+        let handshake_quit = should_quit.clone();
+        let handle = std::thread::spawn(move || {
+            handle_client_handshake(server_stream, 44, &server_event_tx, &handshake_quit)
+        });
+
+        let ClientMessage::EndpointControl { kind, data } = endpoint_hello(80, 29) else {
+            unreachable!("endpoint hello is an endpoint control message");
+        };
+        let mut hello: EndpointClientHello = serde_json::from_str(&data).unwrap();
+        hello.surface_codecs = surface_codecs
+            .iter()
+            .map(|codec| (*codec).to_owned())
+            .collect();
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::EndpointControl {
+                kind,
+                data: serde_json::to_string(&hello).unwrap(),
+            },
+        )
+        .expect("write shell hello");
+
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        let welcome = endpoint_welcome(welcome);
+        let surface_codec = match server_event_rx
+            .blocking_recv()
+            .expect("client shell connected event")
+        {
+            ServerEvent::ClientShellConnected {
+                surface_codec,
+                writer,
+                ..
+            } => {
+                drop(writer);
+                surface_codec
+            }
+            other => panic!("expected ClientShellConnected, got {other:?}"),
+        };
+
+        drop(client_stream);
+        should_quit.store(true, Ordering::Release);
+        handle
+            .join()
+            .expect("handshake thread join")
+            .expect("handshake thread result");
+        (welcome, surface_codec)
+    }
+
+    #[test]
+    fn client_shell_handshake_negotiates_surface_v2_when_offered() {
+        use crate::protocol::endpoint::{SurfaceCodec, SURFACE_CODEC_V1, SURFACE_CODEC_V2};
+
+        let (welcome, surface_codec) =
+            handshake_offering_surface_codecs(&[SURFACE_CODEC_V2, SURFACE_CODEC_V1]);
+        assert_eq!(welcome.surface_codec, SURFACE_CODEC_V2);
+        assert_eq!(surface_codec, SurfaceCodec::V2);
+    }
+
+    #[test]
+    fn client_shell_handshake_keeps_surface_v1_for_a_v1_only_client() {
+        use crate::protocol::endpoint::{SurfaceCodec, SURFACE_CODEC_V1};
+
+        let (welcome, surface_codec) = handshake_offering_surface_codecs(&[SURFACE_CODEC_V1]);
+        assert_eq!(welcome.surface_codec, SURFACE_CODEC_V1);
+        assert_eq!(surface_codec, SurfaceCodec::V1);
+    }
+
     #[test]
     fn dedicated_client_shell_handshake_uses_surface_viewport() {
         let (mut client_stream, server_stream, _path) = local_stream_pair("client-shell-handshake");
@@ -1829,6 +1911,7 @@ mod tests {
                 endpoint_keybindings,
                 mouse_capture,
                 surface_active,
+                surface_codec,
                 writer,
             } => {
                 assert_eq!(client_id, 43);
@@ -1839,6 +1922,7 @@ mod tests {
                 assert!(endpoint_keybindings);
                 assert!(mouse_capture);
                 assert!(surface_active);
+                assert_eq!(surface_codec, crate::protocol::endpoint::SurfaceCodec::V1);
                 drop(writer);
             }
             other => panic!("expected ClientShellConnected, got {other:?}"),

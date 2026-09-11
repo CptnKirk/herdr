@@ -12,6 +12,8 @@ use std::io::{self, Read, Write};
 
 use serde::{Deserialize, Serialize};
 
+use super::endpoint::SurfaceCodec;
+
 // ---------------------------------------------------------------------------
 // Protocol constants
 // ---------------------------------------------------------------------------
@@ -1606,9 +1608,34 @@ impl From<io::Error> for FramingError {
 /// Returns `FramingError::Bincode` if the payload length exceeds `u32::MAX`
 /// (would be truncated by the length prefix cast).
 pub fn write_message<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<(), FramingError> {
-    let payload = bincode::serde::encode_to_vec(msg, bincode::config::standard())
-        .map_err(|e| FramingError::Bincode(e.to_string()))?;
+    write_frame(writer, &encode_payload(msg)?)
+}
 
+/// Writes a server message in the pane surface codec one client negotiated.
+///
+/// `shell.surface.v2` appends the cells' underline colors to pane surface
+/// messages. Every other message, and every message under v1, is written
+/// exactly as [`write_message`] writes it.
+pub fn write_server_message<W: Write>(
+    writer: &mut W,
+    msg: &ServerMessage,
+    codec: SurfaceCodec,
+) -> Result<(), FramingError> {
+    let mut payload = encode_payload(msg)?;
+    if codec == SurfaceCodec::V2 {
+        if let Some(trailer) = UnderlineColorTrailer::from_message(msg) {
+            payload.extend_from_slice(&encode_payload(&trailer)?);
+        }
+    }
+    write_frame(writer, &payload)
+}
+
+fn encode_payload<M: Serialize>(msg: &M) -> Result<Vec<u8>, FramingError> {
+    bincode::serde::encode_to_vec(msg, bincode::config::standard())
+        .map_err(|e| FramingError::Bincode(e.to_string()))
+}
+
+fn write_frame<W: Write>(writer: &mut W, payload: &[u8]) -> Result<(), FramingError> {
     let len = payload.len();
     if len > u32::MAX as usize {
         return Err(FramingError::Bincode(format!(
@@ -1618,7 +1645,7 @@ pub fn write_message<W: Write, M: Serialize>(writer: &mut W, msg: &M) -> Result<
     }
 
     writer.write_all(&(len as u32).to_le_bytes())?;
-    writer.write_all(&payload)?;
+    writer.write_all(payload)?;
     writer.flush()?;
     Ok(())
 }
@@ -1632,6 +1659,46 @@ pub fn read_message<R: Read, M: for<'de> Deserialize<'de>>(
     reader: &mut R,
     max_frame_size: usize,
 ) -> Result<M, FramingError> {
+    let payload = read_frame(reader, max_frame_size)?;
+    let (msg, consumed) = decode_payload(&payload)?;
+    reject_trailing_bytes(consumed, payload.len())?;
+    Ok(msg)
+}
+
+/// Reads a server message in the pane surface codec this connection negotiated.
+pub fn read_server_message<R: Read>(
+    reader: &mut R,
+    max_frame_size: usize,
+    codec: SurfaceCodec,
+) -> Result<ServerMessage, FramingError> {
+    let payload = read_frame(reader, max_frame_size)?;
+    decode_server_message(&payload, codec)
+}
+
+/// Decodes one server message payload in the given pane surface codec.
+///
+/// Under `shell.surface.v2` a pane surface message must carry its underline
+/// color trailer, and nothing may follow it.
+pub fn decode_server_message(
+    payload: &[u8],
+    codec: SurfaceCodec,
+) -> Result<ServerMessage, FramingError> {
+    let (mut msg, mut consumed) = decode_payload::<ServerMessage>(payload)?;
+    if codec == SurfaceCodec::V2 && UnderlineColorTrailer::carried_by(&msg) {
+        let (trailer, trailer_len) = decode_payload::<UnderlineColorTrailer>(&payload[consumed..])
+            .map_err(|e| {
+                FramingError::Bincode(format!(
+                    "pane surface lacks its shell.surface.v2 underline colors: {e}"
+                ))
+            })?;
+        trailer.apply(&mut msg)?;
+        consumed += trailer_len;
+    }
+    reject_trailing_bytes(consumed, payload.len())?;
+    Ok(msg)
+}
+
+fn read_frame<R: Read>(reader: &mut R, max_frame_size: usize) -> Result<Vec<u8>, FramingError> {
     // Read the 4-byte length prefix, reassembling partial reads.
     let mut len_buf = [0u8; LENGTH_PREFIX_BYTES];
     read_exact_or_eof(reader, &mut len_buf)?;
@@ -1647,21 +1714,114 @@ pub fn read_message<R: Read, M: for<'de> Deserialize<'de>>(
     // Read the payload, reassembling partial reads.
     let mut payload = vec![0u8; claimed_len];
     read_exact_or_eof(reader, &mut payload)?;
+    Ok(payload)
+}
 
-    let (msg, consumed) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())
-        .map_err(|e| FramingError::Bincode(e.to_string()))?;
+fn decode_payload<M: for<'de> Deserialize<'de>>(
+    payload: &[u8],
+) -> Result<(M, usize), FramingError> {
+    bincode::serde::decode_from_slice(payload, bincode::config::standard())
+        .map_err(|e| FramingError::Bincode(e.to_string()))
+}
 
-    // Enforce that the decoder consumed the full payload.
-    // Trailing bytes after the decoded message indicate a protocol violation
-    // (e.g., a corrupted length prefix or concatenated payloads).
+/// Trailing bytes after the decoded message indicate a protocol violation
+/// (e.g., a corrupted length prefix or concatenated payloads).
+fn reject_trailing_bytes(consumed: usize, claimed_len: usize) -> Result<(), FramingError> {
     if consumed != claimed_len {
         return Err(FramingError::Bincode(format!(
             "decoded {} bytes but payload length was {claimed_len}; trailing bytes are not allowed",
             consumed
         )));
     }
+    Ok(())
+}
 
-    Ok(msg)
+/// Underline colors that `shell.surface.v2` appends to a pane surface message.
+///
+/// Entries are `(cell index, packed color)` for cells whose color is set. A
+/// patch indexes its rows' cells in order, as if they were concatenated.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct UnderlineColorTrailer {
+    cells: Vec<(u32, u32)>,
+    popup: Vec<(u32, u32)>,
+}
+
+impl UnderlineColorTrailer {
+    fn carried_by(msg: &ServerMessage) -> bool {
+        matches!(
+            msg,
+            ServerMessage::PaneSurface(_) | ServerMessage::PaneSurfacePatch(_)
+        )
+    }
+
+    fn from_message(msg: &ServerMessage) -> Option<Self> {
+        match msg {
+            ServerMessage::PaneSurface(surface) => Some(Self {
+                cells: underline_color_entries(&surface.frame.cells),
+                popup: surface
+                    .popup
+                    .as_ref()
+                    .map(|popup| underline_color_entries(&popup.frame.cells))
+                    .unwrap_or_default(),
+            }),
+            ServerMessage::PaneSurfacePatch(patch) => Some(Self {
+                cells: underline_color_entries(patch.rows.iter().flat_map(|row| &row.cells)),
+                popup: Vec::new(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn apply(&self, msg: &mut ServerMessage) -> Result<(), FramingError> {
+        match msg {
+            ServerMessage::PaneSurface(surface) => {
+                apply_underline_colors(surface.frame.cells.iter_mut(), &self.cells)?;
+                match surface.popup.as_mut() {
+                    Some(popup) => {
+                        apply_underline_colors(popup.frame.cells.iter_mut(), &self.popup)
+                    }
+                    None => apply_underline_colors(std::iter::empty(), &self.popup),
+                }
+            }
+            ServerMessage::PaneSurfacePatch(patch) => {
+                apply_underline_colors(
+                    patch.rows.iter_mut().flat_map(|row| row.cells.iter_mut()),
+                    &self.cells,
+                )?;
+                apply_underline_colors(std::iter::empty(), &self.popup)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+fn underline_color_entries<'a>(cells: impl IntoIterator<Item = &'a CellData>) -> Vec<(u32, u32)> {
+    cells
+        .into_iter()
+        .enumerate()
+        .filter(|(_, cell)| cell.underline_color != 0)
+        .map(|(index, cell)| (index as u32, cell.underline_color))
+        .collect()
+}
+
+fn apply_underline_colors<'a>(
+    cells: impl Iterator<Item = &'a mut CellData>,
+    entries: &[(u32, u32)],
+) -> Result<(), FramingError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut cells = cells.collect::<Vec<_>>();
+    let len = cells.len();
+    for &(index, color) in entries {
+        let cell = cells.get_mut(index as usize).ok_or_else(|| {
+            FramingError::Bincode(format!(
+                "underline color names cell {index} of a {len}-cell surface"
+            ))
+        })?;
+        cell.underline_color = color;
+    }
+    Ok(())
 }
 
 /// Like `Read::read_exact`, but returns `FramingError::UnexpectedEof`
@@ -2386,6 +2546,241 @@ mod tests {
         let (decoded, _): (ServerMessage, _) =
             bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
         assert_eq!(decoded, patch(0));
+    }
+
+    fn colored_pane_surface() -> ServerMessage {
+        let cell = |symbol: &str, underline_color| CellData {
+            symbol: symbol.into(),
+            fg: 0,
+            bg: 0,
+            modifier: 0,
+            underline_color,
+            skip: false,
+            hyperlink: None,
+        };
+        let red = color_to_u32(Color::Rgb(255, 0, 0));
+        ServerMessage::PaneSurface(PaneSurfaceFrame {
+            boot_id: "boot-1".into(),
+            projection_revision: 1,
+            surface_revision: 1,
+            frame: FrameData {
+                cells: vec![cell("a", 0), cell("b", red), cell("c", 0)],
+                width: 3,
+                height: 1,
+                cursor: None,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            },
+            panes: Vec::new(),
+            splits: Vec::new(),
+            popup: Some(Box::new(ClientShellPopupSurface {
+                terminal_id: "popup".into(),
+                title: "popup".into(),
+                width: None,
+                height: None,
+                frame: FrameData {
+                    cells: vec![cell("p", color_to_u32(Color::Indexed(196)))],
+                    width: 1,
+                    height: 1,
+                    cursor: None,
+                    hyperlinks: Vec::new(),
+                    graphics: Vec::new(),
+                },
+                mouse_reporting: false,
+                sgr_pixel_mouse: false,
+                pixel_width: 0,
+                pixel_height: 0,
+            })),
+            graphics: SurfaceGraphicsScene::default(),
+        })
+    }
+
+    fn colored_pane_surface_patch() -> ServerMessage {
+        let cell = |symbol: &str, underline_color| CellData {
+            symbol: symbol.into(),
+            fg: 1,
+            bg: 2,
+            modifier: 3,
+            underline_color,
+            skip: false,
+            hyperlink: None,
+        };
+        ServerMessage::PaneSurfacePatch(PaneSurfacePatch {
+            boot_id: "boot-1".into(),
+            projection_revision: 3,
+            base_surface_revision: 7,
+            surface_revision: 8,
+            rows: vec![
+                PaneSurfacePatchRow {
+                    x: 2,
+                    y: 4,
+                    cells: vec![cell("x", 0)],
+                },
+                PaneSurfacePatchRow {
+                    x: 0,
+                    y: 5,
+                    cells: vec![cell("y", 0), cell("z", color_to_u32(Color::Rgb(0, 255, 0)))],
+                },
+            ],
+            panes: Vec::new(),
+            cursor: None,
+        })
+    }
+
+    fn encode_in(msg: &ServerMessage, codec: SurfaceCodec) -> Vec<u8> {
+        let mut framed = Vec::new();
+        write_server_message(&mut framed, msg, codec).unwrap();
+        framed.split_off(LENGTH_PREFIX_BYTES)
+    }
+
+    #[test]
+    fn surface_codec_v1_writes_colored_cells_as_the_frozen_v1_bytes() {
+        // The same message as `pane_surface_patch_roundtrip`, whose digest is frozen, but colored.
+        let mut msg = ServerMessage::PaneSurfacePatch(PaneSurfacePatch {
+            boot_id: "boot-1".into(),
+            projection_revision: 3,
+            base_surface_revision: 7,
+            surface_revision: 8,
+            rows: vec![PaneSurfacePatchRow {
+                x: 2,
+                y: 4,
+                cells: vec![CellData {
+                    symbol: "x".into(),
+                    fg: 1,
+                    bg: 2,
+                    modifier: 3,
+                    underline_color: color_to_u32(Color::Rgb(255, 0, 0)),
+                    skip: false,
+                    hyperlink: None,
+                }],
+            }],
+            panes: Vec::new(),
+            cursor: Some(CursorState {
+                x: 2,
+                y: 4,
+                visible: true,
+                shape: 2,
+            }),
+        });
+
+        let payload = encode_in(&msg, SurfaceCodec::V1);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&payload)),
+            "0814b99a1dc6eaf7918424aa416c066509cbfb73b72344a809c27cde78cb6dbd"
+        );
+        let decoded = decode_server_message(&payload, SurfaceCodec::V1).unwrap();
+        let ServerMessage::PaneSurfacePatch(patch) = &mut msg else {
+            unreachable!();
+        };
+        patch.rows[0].cells[0].underline_color = 0;
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn surface_codec_v2_round_trips_underline_colors() {
+        for msg in [colored_pane_surface(), colored_pane_surface_patch()] {
+            let payload = encode_in(&msg, SurfaceCodec::V2);
+            assert_eq!(
+                decode_server_message(&payload, SurfaceCodec::V2).unwrap(),
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn surface_codec_v2_payload_is_frozen() {
+        // A v2 surface is the v1 payload followed by its underline color trailer.
+        for msg in [colored_pane_surface(), colored_pane_surface_patch()] {
+            let payload = encode_in(&msg, SurfaceCodec::V2);
+            assert!(payload.starts_with(&encode_in(&msg, SurfaceCodec::V1)));
+        }
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(encode_in(&colored_pane_surface(), SurfaceCodec::V2))
+            ),
+            "f25dd95318fd5264497fd338325b30ff62d36e0b4f2949bc8299a92bb5ba2450"
+        );
+        assert_eq!(
+            format!(
+                "{:x}",
+                Sha256::digest(encode_in(&colored_pane_surface_patch(), SurfaceCodec::V2))
+            ),
+            "3ffb85dc74a6e7c10da7e8451e1ffe1325f2185092f5bfddb2a2fcceed75f9a7"
+        );
+    }
+
+    #[test]
+    fn surface_codec_v2_leaves_other_messages_as_v1() {
+        let msg = ServerMessage::WindowTitle {
+            title: Some("t".into()),
+        };
+        let payload = encode_in(&msg, SurfaceCodec::V2);
+        assert_eq!(payload, encode_in(&msg, SurfaceCodec::V1));
+        assert_eq!(
+            decode_server_message(&payload, SurfaceCodec::V2).unwrap(),
+            msg
+        );
+    }
+
+    #[test]
+    fn surface_codec_v2_rejects_a_surface_without_its_trailer() {
+        let payload = encode_in(&colored_pane_surface(), SurfaceCodec::V1);
+        let error = decode_server_message(&payload, SurfaceCodec::V2).unwrap_err();
+        assert!(
+            error.to_string().contains("underline colors"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn surface_codec_v2_rejects_an_out_of_range_underline_color() {
+        let msg = colored_pane_surface_patch();
+        let mut payload = encode_in(&msg, SurfaceCodec::V1);
+        payload.extend(
+            bincode::serde::encode_to_vec(
+                UnderlineColorTrailer {
+                    cells: vec![(3, 1)],
+                    popup: Vec::new(),
+                },
+                bincode::config::standard(),
+            )
+            .unwrap(),
+        );
+        let error = decode_server_message(&payload, SurfaceCodec::V2).unwrap_err();
+        assert!(
+            error.to_string().contains("cell 3 of a 3-cell surface"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn surface_codec_v1_frames_exactly_like_write_message() {
+        for msg in [colored_pane_surface(), colored_pane_surface_patch()] {
+            let mut framed = Vec::new();
+            write_server_message(&mut framed, &msg, SurfaceCodec::V1).unwrap();
+            let mut stock = Vec::new();
+            write_message(&mut stock, &msg).unwrap();
+            assert_eq!(framed, stock);
+        }
+    }
+
+    #[test]
+    fn read_message_rejects_a_v2_surface_frame() {
+        let mut framed = Vec::new();
+        write_server_message(&mut framed, &colored_pane_surface(), SurfaceCodec::V2).unwrap();
+        let error =
+            read_message::<_, ServerMessage>(&mut framed.as_slice(), MAX_FRAME_SIZE).unwrap_err();
+        assert!(
+            error.to_string().contains("trailing bytes are not allowed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn surface_codec_v1_rejects_a_v2_trailer() {
+        let payload = encode_in(&colored_pane_surface(), SurfaceCodec::V2);
+        assert!(decode_server_message(&payload, SurfaceCodec::V1).is_err());
     }
 
     #[test]

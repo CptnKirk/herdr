@@ -589,7 +589,11 @@ impl HeadlessServer {
                 crate::protocol::MAX_FRAME_SIZE
             };
             let mut shell_assets_deferred = false;
-            let serialized = match Self::frame_server_message_with_max(prepared.message(), max) {
+            let serialized = match Self::frame_client_message_with_max(
+                prepared.message(),
+                client.surface_codec,
+                max,
+            ) {
                 Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
@@ -602,7 +606,11 @@ impl HeadlessServer {
                     }
                     next_shell_graphics_delivery = None;
                     shell_assets_deferred = true;
-                    match Self::frame_server_message(prepared.message()) {
+                    match Self::frame_client_message_with_max(
+                        prepared.message(),
+                        client.surface_codec,
+                        crate::protocol::MAX_FRAME_SIZE,
+                    ) {
                         Ok(framed) => framed,
                         Err(err) => {
                             warn!(client_id, err = %err, "failed to serialize pane surface without assets");

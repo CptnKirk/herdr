@@ -504,20 +504,23 @@ impl HeadlessServer {
             } else {
                 protocol::MAX_FRAME_SIZE
             };
-            let serialized =
-                match Self::frame_server_message_with_max(prepared.message(), max_frame_size) {
-                    Ok(serialized) => serialized,
-                    Err(error) => {
-                        warn!(
-                            client_id,
-                            %error,
-                            "failed to serialize retained pane surface patch"
-                        );
-                        client.defer_full_render();
-                        deferred += 1;
-                        continue;
-                    }
-                };
+            let serialized = match Self::frame_client_message_with_max(
+                prepared.message(),
+                client.surface_codec,
+                max_frame_size,
+            ) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    warn!(
+                        client_id,
+                        %error,
+                        "failed to serialize retained pane surface patch"
+                    );
+                    client.defer_full_render();
+                    deferred += 1;
+                    continue;
+                }
+            };
             crate::render_prof::counter("retained_surface.bytes", serialized.len() as u64);
             match writer.render.try_send(serialized) {
                 Ok(()) => {

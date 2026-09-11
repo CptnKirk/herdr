@@ -27,6 +27,44 @@ pub const PRESENTATION_EFFECTS_READY_KIND: &str = "endpoint.presentation.ready.v
 pub const HEALTH_CHECK_CAPABILITY: &str = "health_check";
 pub const HEALTH_PING_KIND: &str = "endpoint.health.ping.v1";
 pub const HEALTH_PONG_KIND: &str = "endpoint.health.pong.v1";
+pub const SURFACE_CODEC_V2: &str = "shell.surface.v2";
+
+/// Pane surface codec negotiated for one client-owned shell connection.
+///
+/// `V2` writes the `V1` payload followed by the cells' underline colors, so a
+/// server that only knows `V1` is never sent a byte it cannot decode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SurfaceCodec {
+    #[default]
+    V1,
+    V2,
+}
+
+impl SurfaceCodec {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::V1 => SURFACE_CODEC_V1,
+            Self::V2 => SURFACE_CODEC_V2,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            SURFACE_CODEC_V1 => Some(Self::V1),
+            SURFACE_CODEC_V2 => Some(Self::V2),
+            _ => None,
+        }
+    }
+
+    /// Picks the newest codec the client offered. `V1` is the floor every client supports.
+    pub fn negotiate(offered: &[String]) -> Self {
+        if offered.iter().any(|codec| codec == SURFACE_CODEC_V2) {
+            Self::V2
+        } else {
+            Self::V1
+        }
+    }
+}
 
 fn default_true() -> bool {
     true
@@ -117,6 +155,24 @@ impl EndpointServerWelcome {
             ],
             error: None,
         }
+    }
+
+    pub fn with_surface_codec(mut self, codec: SurfaceCodec) -> Self {
+        self.surface_codec = codec.name().into();
+        self
+    }
+
+    /// Returns the surface codec this welcome selected, if the rest of its core is one
+    /// this client speaks.
+    pub fn negotiated_surface_codec(&self) -> Option<SurfaceCodec> {
+        if self.generation != ENDPOINT_PROTOCOL_GENERATION
+            || self.snapshot_codec != SNAPSHOT_CODEC_V1
+            || self.input_codec != INPUT_CODEC_V1
+            || self.blob_codec != BLOB_CODEC_V1
+        {
+            return None;
+        }
+        SurfaceCodec::from_name(&self.surface_codec)
     }
 
     pub fn incompatible(code: &str, message: impl Into<String>) -> Self {
@@ -306,6 +362,57 @@ mod tests {
         let mut value = hello();
         value.blob_codecs.clear();
         assert!(!value.supports_required_codecs());
+    }
+
+    #[test]
+    fn surface_codec_negotiation_prefers_v2_and_falls_back_to_v1() {
+        let offered = |codecs: &[&str]| {
+            SurfaceCodec::negotiate(
+                &codecs
+                    .iter()
+                    .map(|codec| (*codec).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            offered(&[SURFACE_CODEC_V2, SURFACE_CODEC_V1]),
+            SurfaceCodec::V2
+        );
+        assert_eq!(
+            offered(&[SURFACE_CODEC_V1, SURFACE_CODEC_V2]),
+            SurfaceCodec::V2
+        );
+        assert_eq!(offered(&[SURFACE_CODEC_V1]), SurfaceCodec::V1);
+        assert_eq!(
+            offered(&[SURFACE_CODEC_V1, "shell.surface.v9"]),
+            SurfaceCodec::V1
+        );
+    }
+
+    #[test]
+    fn frozen_generation_one_welcome_selects_surface_codec_v1() {
+        let welcome: EndpointServerWelcome = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/endpoint-welcome-v1.json"
+        )))
+        .unwrap();
+        assert_eq!(welcome.negotiated_surface_codec(), Some(SurfaceCodec::V1));
+    }
+
+    #[test]
+    fn compatible_welcome_stays_v1_until_v2_is_negotiated() {
+        let welcome = EndpointServerWelcome::compatible(Vec::new());
+        assert_eq!(welcome.surface_codec, SURFACE_CODEC_V1);
+        let welcome = welcome.with_surface_codec(SurfaceCodec::V2);
+        assert_eq!(welcome.surface_codec, SURFACE_CODEC_V2);
+        assert_eq!(welcome.negotiated_surface_codec(), Some(SurfaceCodec::V2));
+    }
+
+    #[test]
+    fn welcome_with_an_unknown_surface_codec_is_incompatible() {
+        let mut welcome = EndpointServerWelcome::compatible(Vec::new());
+        welcome.surface_codec = "shell.surface.v9".into();
+        assert_eq!(welcome.negotiated_surface_codec(), None);
     }
 
     #[test]

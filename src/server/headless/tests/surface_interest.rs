@@ -58,6 +58,7 @@ async fn metadata_only_shell_is_isolated_until_surface_activation() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: false,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -260,6 +261,7 @@ async fn presentation_sync_epoch_replays_modes_and_title() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -374,6 +376,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer: source_writer,
         })
     );
@@ -399,6 +402,7 @@ async fn two_headless_servers_drive_atomic_endpoint_handoff() {
             endpoint_keybindings: true,
             mouse_capture: true,
             surface_active: false,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer: target_writer,
         })
     );

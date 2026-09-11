@@ -10,9 +10,9 @@ use tracing::info;
 
 use crate::ipc::LocalStream;
 use crate::protocol::endpoint::{
-    EndpointClientHello, EndpointServerWelcome, BLOB_CODEC_V1, ENDPOINT_HELLO_KIND,
+    EndpointClientHello, EndpointServerWelcome, SurfaceCodec, BLOB_CODEC_V1, ENDPOINT_HELLO_KIND,
     ENDPOINT_PROTOCOL_GENERATION, ENDPOINT_WELCOME_KIND, INPUT_CODEC_V1, SNAPSHOT_CODEC_V1,
-    SURFACE_CODEC_V1,
+    SURFACE_CODEC_V1, SURFACE_CODEC_V2,
 };
 use crate::protocol::{
     self, ClientMessage, RenderEncoding, ServerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION,
@@ -122,6 +122,7 @@ pub(super) struct HandshakeResult {
     pub(super) encoding: RenderEncoding,
     pub(super) endpoint_methods: Option<Vec<String>>,
     pub(super) endpoint_capabilities: Option<Vec<String>>,
+    pub(super) surface_codec: SurfaceCodec,
 }
 
 pub(crate) fn probe_endpoint_negotiation(
@@ -143,7 +144,8 @@ pub(crate) fn probe_endpoint_negotiation(
     Ok(super::endpoint::EndpointNegotiation::new(
         handshake.endpoint_methods.unwrap_or_default(),
         handshake.endpoint_capabilities.unwrap_or_default(),
-    ))
+    )
+    .with_surface_codec(handshake.surface_codec))
 }
 
 /// Performs the client→server handshake.
@@ -183,7 +185,7 @@ pub(super) fn do_handshake(
             mouse_capture,
             surface_active,
             snapshot_codecs: vec![SNAPSHOT_CODEC_V1.into()],
-            surface_codecs: vec![SURFACE_CODEC_V1.into()],
+            surface_codecs: vec![SURFACE_CODEC_V2.into(), SURFACE_CODEC_V1.into()],
             input_codecs: vec![INPUT_CODEC_V1.into()],
             blob_codecs: vec![BLOB_CODEC_V1.into()],
         };
@@ -249,26 +251,23 @@ pub(super) fn do_handshake(
                 error: error.message,
             });
         }
-        if welcome.generation != ENDPOINT_PROTOCOL_GENERATION
-            || welcome.snapshot_codec != SNAPSHOT_CODEC_V1
-            || welcome.surface_codec != SURFACE_CODEC_V1
-            || welcome.input_codec != INPUT_CODEC_V1
-            || welcome.blob_codec != BLOB_CODEC_V1
-        {
+        let Some(surface_codec) = welcome.negotiated_surface_codec() else {
             return Err(ClientError::HandshakeRejected {
                 version: welcome.generation,
                 error: "server has no compatible endpoint core; update this machine".into(),
             });
-        }
+        };
         info!(
             generation = welcome.generation,
             server_version = %welcome.server_version,
+            surface_codec = surface_codec.name(),
             "endpoint handshake succeeded"
         );
         return Ok(HandshakeResult {
             encoding: RenderEncoding::SemanticFrame,
             endpoint_methods: Some(welcome.methods),
             endpoint_capabilities: Some(welcome.capabilities),
+            surface_codec,
         });
     }
 
@@ -286,6 +285,7 @@ pub(super) fn do_handshake(
                 encoding,
                 endpoint_methods: None,
                 endpoint_capabilities: None,
+                surface_codec: SurfaceCodec::V1,
             })
         }
         _ => Err(ClientError::Protocol(protocol::FramingError::Io(

@@ -610,6 +610,7 @@ async fn client_shell_attach_seeds_workspace() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -640,6 +641,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -776,6 +778,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -920,6 +923,7 @@ fn connect_test_shell(
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -1246,6 +1250,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer: local_writer,
         })
     );
@@ -1270,6 +1275,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             endpoint_keybindings: true,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer: endpoint_writer,
         })
     );
@@ -1969,6 +1975,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -2219,6 +2226,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
