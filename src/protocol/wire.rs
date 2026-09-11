@@ -716,7 +716,7 @@ pub enum AttachScrollSource {
 
 /// A single cell in a rendered frame, serialized independently from ratatui's
 /// `Cell` type to keep the wire protocol stable.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, bincode::Decode)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellData {
     /// Grapheme cluster displayed in this cell (usually 1–2 chars).
     pub symbol: String,
@@ -726,6 +726,11 @@ pub struct CellData {
     pub bg: u32,
     /// Bitmask of style modifiers (bold, italic, etc.) plus Herdr extension bits.
     pub modifier: u16,
+    /// Underline color as a packed u32, encoded like `fg` and `bg`.
+    ///
+    /// Not part of the frozen `shell.surface.v1` payload, so it never reaches bincode.
+    #[serde(skip)]
+    pub underline_color: u32,
     /// Whether this cell should be skipped during diff-based rendering.
     pub skip: bool,
     /// Index into `FrameData::hyperlinks` for this cell's OSC 8 target, if any.
@@ -747,6 +752,24 @@ impl Clone for CellData {
     }
 }
 
+// Mirrors the serde layout, which skips `underline_color`; a derive would read it.
+impl<Context> bincode::Decode<Context> for CellData {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        Ok(Self {
+            symbol: bincode::Decode::decode(decoder)?,
+            fg: bincode::Decode::decode(decoder)?,
+            bg: bincode::Decode::decode(decoder)?,
+            modifier: bincode::Decode::decode(decoder)?,
+            underline_color: 0,
+            skip: bincode::Decode::decode(decoder)?,
+            hyperlink: bincode::Decode::decode(decoder)?,
+        })
+    }
+}
+bincode::impl_borrow_decode!(CellData);
+
 impl CellData {
     pub(crate) fn from_ratatui_cell(cell: &ratatui::buffer::Cell) -> Self {
         Self {
@@ -754,6 +777,7 @@ impl CellData {
             fg: color_to_u32(cell.fg),
             bg: color_to_u32(cell.bg),
             modifier: modifier_to_u16(cell.modifier),
+            underline_color: color_to_u32(cell.underline_color),
             skip: cell.skip,
             hyperlink: None,
         }
@@ -906,6 +930,7 @@ impl FrameData {
                 cell.set_symbol(&cell_data.symbol);
                 cell.fg = u32_to_color(cell_data.fg);
                 cell.bg = u32_to_color(cell_data.bg);
+                cell.underline_color = u32_to_color(cell_data.underline_color);
                 cell.modifier = u16_to_modifier(cell_data.modifier);
                 cell.skip = cell_data.skip;
             }
@@ -2530,6 +2555,62 @@ mod tests {
     }
 
     #[test]
+    fn from_ratatui_cell_preserves_underline_color() {
+        let mut cell = ratatui::buffer::Cell::default();
+        cell.underline_color = Color::Rgb(255, 0, 0);
+
+        assert_eq!(
+            CellData::from_ratatui_cell(&cell).underline_color,
+            color_to_u32(Color::Rgb(255, 0, 0))
+        );
+    }
+
+    #[test]
+    fn to_ratatui_buffer_preserves_underline_color() {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 1, 1));
+        buffer.cell_mut((0, 0)).unwrap().underline_color = Color::Rgb(255, 0, 0);
+
+        let restored = FrameData::from_ratatui_buffer(&buffer, None)
+            .to_ratatui_buffer()
+            .unwrap();
+        assert_eq!(restored[(0, 0)].underline_color, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn underline_color_stays_off_the_v1_surface_wire() {
+        let patch = |underline_color| {
+            ServerMessage::PaneSurfacePatch(PaneSurfacePatch {
+                boot_id: "boot-1".into(),
+                projection_revision: 3,
+                base_surface_revision: 7,
+                surface_revision: 8,
+                rows: vec![PaneSurfacePatchRow {
+                    x: 2,
+                    y: 4,
+                    cells: vec![CellData {
+                        symbol: "x".into(),
+                        fg: 1,
+                        bg: 2,
+                        modifier: 3,
+                        underline_color,
+                        skip: false,
+                        hyperlink: None,
+                    }],
+                }],
+                panes: Vec::new(),
+                cursor: None,
+            })
+        };
+        let colored = patch(color_to_u32(Color::Rgb(255, 0, 0)));
+        assert_eq!(encoded_sha256(&colored), encoded_sha256(&patch(0)));
+
+        let encoded = bincode::serde::encode_to_vec(&colored, bincode::config::standard()).unwrap();
+        let (decoded, _): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).unwrap();
+        assert_eq!(decoded, patch(0));
+    }
+
+    #[test]
     fn server_frame_roundtrip_nontrivial() {
         // Build a 3×2 frame with varied styles (≥2×2).
         let frame = FrameData {
@@ -2539,6 +2620,7 @@ mod tests {
                     fg: color_to_u32(Color::Red),
                     bg: color_to_u32(Color::Black),
                     modifier: Modifier::BOLD.bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 },
@@ -2547,6 +2629,7 @@ mod tests {
                     fg: color_to_u32(Color::Green),
                     bg: color_to_u32(Color::Reset),
                     modifier: Modifier::ITALIC.bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 },
@@ -2555,6 +2638,7 @@ mod tests {
                     fg: color_to_u32(Color::Rgb(255, 128, 0)),
                     bg: color_to_u32(Color::Indexed(220)),
                     modifier: (Modifier::BOLD | Modifier::UNDERLINED).bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: Some(0),
                 },
@@ -2563,6 +2647,7 @@ mod tests {
                     fg: color_to_u32(Color::Reset),
                     bg: color_to_u32(Color::Reset),
                     modifier: Modifier::empty().bits(),
+                    underline_color: 0,
                     skip: true,
                     hyperlink: None,
                 },
@@ -2571,6 +2656,7 @@ mod tests {
                     fg: color_to_u32(Color::Cyan),
                     bg: color_to_u32(Color::Blue),
                     modifier: Modifier::REVERSED.bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 },
@@ -2579,6 +2665,7 @@ mod tests {
                     fg: color_to_u32(Color::Yellow),
                     bg: color_to_u32(Color::Magenta),
                     modifier: Modifier::empty().bits(),
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 },
@@ -2639,6 +2726,7 @@ mod tests {
                     fg: 1,
                     bg: 2,
                     modifier: 3,
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 }],
@@ -3110,6 +3198,7 @@ mod tests {
                 fg: color_to_u32(Color::Rgb((i % 256) as u8, ((i / 256) % 256) as u8, 128)),
                 bg: color_to_u32(Color::Indexed((i % 256) as u8)),
                 modifier: ((i % 16) as u16),
+                underline_color: 0,
                 skip: i % 100 == 0,
                 hyperlink: None,
             })
@@ -3469,6 +3558,7 @@ mod tests {
                     fg: 0,
                     bg: 0,
                     modifier: 0,
+                    underline_color: 0,
                     skip: false,
                     hyperlink: None,
                 };
