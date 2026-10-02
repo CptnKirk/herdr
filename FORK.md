@@ -35,7 +35,8 @@ is not added to v1. This branch adds a second surface codec, `shell.surface.v2`:
 
 - A v2 pane surface or patch frame is the unchanged v1 payload followed by a
   trailer listing `(cell index, color)` for the cells that have an underline
-  color. Every other message is identical under v1 and v2.
+  color. Every other message is identical under v1 and v2, except the delta
+  and scroll payloads described below.
 - The client offers `[shell.surface.v2, shell.surface.v1]` in its endpoint
   hello. The server picks v2 only when it is offered and names its choice in the
   welcome's existing `surface_codec` field.
@@ -82,7 +83,7 @@ herdr 0.9.3's vendored libghostty-vt needs Zig 0.16.0:
 `vendor/libghostty-vt/build.zig.zon` sets `minimum_zig_version = "0.16.0"`.
 This branch was built and tested with 0.16.0 only. If the `zig` on your `PATH`
 is another version, point the build at a 0.16.0 binary without changing `PATH`;
-`build.rs` reads `ZIG` and falls back to `zig`:
+`crates/ghostty-vt/build.rs` reads `ZIG` and falls back to `zig`:
 
 ```sh
 ZIG=/path/to/zig-0.16.0/zig cargo build --release
@@ -99,11 +100,16 @@ generation-1 welcome fixture
 (`frozen_generation_one_welcome_selects_surface_codec_v1`). Upstream's frozen
 v1 and surface-delta fixtures are unchanged.
 
-Each way a pane's cells reach a v2 client has a test that drives the real
-server and decodes what it sent: the full surface and plain patch, delta and
-scroll in `src/server/headless/tests/underline_color.rs`, and reuse in
-`surface_reuse_v2_keeps_underline_colors_and_resends_a_color_change`. Nothing
-outside the repository is needed.
+The full surface and plain patch, delta and scroll each have a test that drives
+the real server and decodes what it sent, in
+`src/server/headless/tests/underline_color.rs`; the same file checks that a
+connecting client keeps the codec it negotiated. Reuse is tested on the
+client's render state, not the whole server, in
+`surface_reuse_v2_keeps_underline_colors_and_resends_a_color_change`. The
+client's own drawing has tests in `render_ansi.rs`: two neighbouring cells that
+differ only in underline color both get their color, and a cell whose only
+change is its color (set, changed or cleared) is redrawn. Nothing outside the
+repository is needed.
 
 ## Changes versus the 0.9.0 fork
 

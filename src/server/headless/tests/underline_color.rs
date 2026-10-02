@@ -180,3 +180,33 @@ async fn v2_surface_scroll_carries_underline_color_on_new_and_shifted_rows() {
     assert_eq!(shell.frame.cells, committed);
     shutdown_test_runtimes(&mut server);
 }
+
+#[tokio::test]
+async fn client_shell_connect_keeps_the_negotiated_surface_codec() {
+    let mut server = test_headless_server();
+    for (client_id, codec) in [(81, SurfaceCodec::V2), (82, SurfaceCodec::V1)] {
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+        server.handle_server_event(ServerEvent::ClientShellConnected {
+            client_id,
+            surface_cols: 80,
+            surface_rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            pixel_mouse: false,
+            direct_graphics: false,
+            endpoint_keybindings: false,
+            mouse_capture: false,
+            surface_active: false,
+            surface_reuse: false,
+            surface_delta: false,
+            surface_scroll: false,
+            surface_codec: codec,
+            writer,
+        });
+        assert_eq!(
+            server.clients[&client_id].render_state.surface_codec(),
+            codec
+        );
+    }
+    shutdown_test_runtimes(&mut server);
+}

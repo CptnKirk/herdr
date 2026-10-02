@@ -1297,6 +1297,65 @@ mod tests {
         );
     }
 
+    fn underlined_frame(colors: &[ratatui::style::Color]) -> FrameData {
+        let width = u16::try_from(colors.len()).expect("narrow test frame");
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
+        for (x, color) in (0..width).zip(colors) {
+            let cell = buffer.cell_mut((x, 0)).expect("cell within bounds");
+            cell.set_symbol("X");
+            cell.modifier = ratatui::style::Modifier::UNDERLINED;
+            cell.underline_color = *color;
+        }
+        FrameData::from_ratatui_buffer(&buffer, None)
+    }
+
+    #[test]
+    fn blit_does_not_merge_adjacent_cells_that_differ_only_in_underline_color() {
+        use ratatui::style::Color;
+        let mut out = Vec::new();
+        blit_frame_to(
+            &mut out,
+            &underlined_frame(&[Color::Rgb(255, 0, 0), Color::Rgb(0, 255, 0)]),
+            None,
+        );
+        let out = String::from_utf8_lossy(&out);
+        assert!(
+            out.contains(";58:2::255:0:0mX") && out.contains(";58:2::0:255:0mX"),
+            "blit bytes lack one of the two underline colors: {out:?}"
+        );
+    }
+
+    #[test]
+    fn blit_redraws_a_cell_whose_only_change_is_its_underline_color() {
+        use ratatui::style::Color;
+        let mut encoder = BlitEncoder::new();
+        let mut previous = None;
+        for color in [
+            Color::Reset,
+            Color::Rgb(255, 0, 0),
+            Color::Rgb(0, 255, 0),
+            Color::Reset,
+        ] {
+            let frame = underlined_frame(&[color]);
+            let encoded = encoder.encode(&frame, false);
+            let out = String::from_utf8_lossy(&encoded.bytes).into_owned();
+            if let Some(previous) = previous {
+                assert!(
+                    out.contains('X'),
+                    "underline color {previous:?} -> {color:?} was not redrawn: {out:?}"
+                );
+            }
+            if color == Color::Rgb(0, 255, 0) {
+                assert!(out.contains(";58:2::0:255:0mX"), "{out:?}");
+            }
+            if color == Color::Reset {
+                assert!(!out.contains("58:"), "cleared color still sent: {out:?}");
+            }
+            encoder.commit(frame, encoded);
+            previous = Some(color);
+        }
+    }
+
     #[test]
     fn cells_equal_identical() {
         let a = make_cell("A", 2, 1, 0);
