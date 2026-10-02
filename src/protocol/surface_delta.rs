@@ -3,7 +3,10 @@
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 
-use super::{CellData, PaneSurfaceFrame, PaneSurfacePatchRow, ServerMessage};
+use super::endpoint::SurfaceCodec;
+use super::{
+    CellData, PaneSurfaceFrame, PaneSurfacePatchRow, ServerMessage, UnderlineColorTrailer,
+};
 
 mod decode;
 
@@ -12,6 +15,7 @@ pub(crate) const MESSAGE_KIND: &str = "endpoint.surface-delta.v1";
 pub(crate) const MAX_SPANS: usize = 4096;
 
 // This binary layout is frozen with MESSAGE_KIND, independently of the v1 core.
+// Under `shell.surface.v2` an `UnderlineColorTrailer` over the sent cells follows it.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SurfaceDelta<S, R = Vec<PaneSurfacePatchRow>, P = GridUpdate> {
     pub(crate) base_projection_revision: u64,
@@ -29,14 +33,15 @@ pub(crate) enum GridUpdate {
 
 #[cfg(test)]
 pub(crate) fn decode(data: &str) -> Result<SurfaceDelta<PaneSurfaceFrame>, String> {
-    decode::decode(data, None)
+    decode::decode(data, None, SurfaceCodec::V1)
 }
 
 pub(crate) fn decode_for(
     data: &str,
     expected: (u16, u16),
+    codec: SurfaceCodec,
 ) -> Result<SurfaceDelta<PaneSurfaceFrame>, String> {
-    decode::decode(data, Some(expected))
+    decode::decode(data, Some(expected), codec)
 }
 
 pub(crate) fn apply_rows(cells: &mut [CellData], width: u16, rows: &[PaneSurfacePatchRow]) {
@@ -113,6 +118,7 @@ fn encoded_size(value: &impl Serialize) -> Result<usize, String> {
 pub(crate) fn message(
     last: &PaneSurfaceFrame,
     full: &mut ServerMessage,
+    codec: SurfaceCodec,
 ) -> Result<Option<ServerMessage>, String> {
     let ServerMessage::PaneSurface(surface) = &*full else {
         return Ok(None);
@@ -143,7 +149,7 @@ pub(crate) fn message(
         .popup
         .as_mut()
         .map(|popup| std::mem::take(&mut popup.frame.cells));
-    let encoded = (|| {
+    let encoded: Result<Option<Vec<u8>>, String> = (|| {
         let Some(rows) = changed_rows(&last.frame.cells, &cells, surface.frame.width, full_size)?
         else {
             return Ok(None);
@@ -179,9 +185,21 @@ pub(crate) fn message(
         if encoded_len > max || encoded_len >= full_size {
             return Ok(None);
         }
-        bincode::serde::encode_to_vec(&delta, bincode::config::standard())
-            .map(Some)
-            .map_err(|error| error.to_string())
+        let mut bytes = bincode::serde::encode_to_vec(&delta, bincode::config::standard())
+            .map_err(|error| error.to_string())?;
+        if codec == SurfaceCodec::V2 {
+            let (popup, popup_grid): (&[CellSpan], &[CellData]) = match &delta.popup_cells {
+                Some(GridUpdateRef::Patch(rows)) => (rows, &[]),
+                Some(GridUpdateRef::Replace(cells)) => (&[], cells),
+                None => (&[], &[]),
+            };
+            let trailer = UnderlineColorTrailer::of(
+                delta.rows.iter().flat_map(|span| span.cells),
+                popup.iter().flat_map(|span| span.cells).chain(popup_grid),
+            );
+            bytes.extend(trailer.encode().map_err(|error| error.to_string())?);
+        }
+        Ok(Some(bytes))
     })();
     surface.frame.cells = cells;
     if let (Some(popup), Some(cells)) = (surface.popup.as_mut(), popup_grid) {
@@ -228,9 +246,13 @@ mod tests {
         decoder
             .decode(ServerMessage::PaneSurface(last.clone()))
             .unwrap();
-        let update = message(last, &mut ServerMessage::PaneSurface(next.clone()))
-            .unwrap()
-            .expect("smaller delta");
+        let update = message(
+            last,
+            &mut ServerMessage::PaneSurface(next.clone()),
+            SurfaceCodec::V1,
+        )
+        .unwrap()
+        .expect("smaller delta");
         let mut bytes = Vec::new();
         crate::protocol::write_message(&mut bytes, &update).unwrap();
         let wire = crate::protocol::read_message(
@@ -255,7 +277,9 @@ mod tests {
         reconstruct(&last, &next);
         let expected = next.clone();
         let mut full = ServerMessage::PaneSurface(next);
-        let update = message(&last, &mut full).unwrap().expect("sparse delta");
+        let update = message(&last, &mut full, SurfaceCodec::V1)
+            .unwrap()
+            .expect("sparse delta");
         assert!(framed_len(&update) < 1000);
         let ServerMessage::PaneSurface(next) = full else {
             panic!("full fallback");
@@ -345,15 +369,21 @@ mod tests {
         for cell in &mut next.frame.cells {
             cell.symbol = "x".into();
         }
-        assert!(
-            message(&last, &mut ServerMessage::PaneSurface(next.clone()))
-                .unwrap()
-                .is_none()
-        );
+        assert!(message(
+            &last,
+            &mut ServerMessage::PaneSurface(next.clone()),
+            SurfaceCodec::V1
+        )
+        .unwrap()
+        .is_none());
         next.frame.width += 1;
-        assert!(message(&last, &mut ServerMessage::PaneSurface(next))
-            .unwrap()
-            .is_none());
+        assert!(message(
+            &last,
+            &mut ServerMessage::PaneSurface(next),
+            SurfaceCodec::V1
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -439,9 +469,13 @@ mod tests {
         latest.surface_revision += 1;
         latest.projection_revision += 1;
         latest.frame.cells[1].symbol = "b".into();
-        let update = message(&next, &mut ServerMessage::PaneSurface(latest.clone()))
-            .unwrap()
-            .unwrap();
+        let update = message(
+            &next,
+            &mut ServerMessage::PaneSurface(latest.clone()),
+            SurfaceCodec::V1,
+        )
+        .unwrap()
+        .unwrap();
         let ServerMessage::PaneSurface(decoded) = decoder.decode(update).unwrap() else {
             panic!("full reconstruction");
         };
@@ -482,6 +516,65 @@ mod tests {
     }
 
     #[test]
+    fn surface_delta_v2_carries_underline_colors_of_grid_and_popup() {
+        use ratatui::style::Color;
+        let red = crate::protocol::color_to_u32(Color::Rgb(255, 0, 0));
+        let green = crate::protocol::color_to_u32(Color::Rgb(0, 255, 0));
+        let mut last = surface();
+        last.popup = Some(Box::new(ClientShellPopupSurface {
+            terminal_id: "popup".into(),
+            title: "popup".into(),
+            width: None,
+            height: None,
+            frame: FrameData::from_ratatui_buffer(&Buffer::empty(Rect::new(0, 0, 100, 30)), None),
+            mouse_reporting: false,
+            sgr_pixel_mouse: false,
+            pixel_width: 0,
+            pixel_height: 0,
+        }));
+        let mut next = last.clone();
+        next.surface_revision += 1;
+        next.frame.cells[5].underline_color = red;
+        next.popup.as_mut().unwrap().frame.cells[7].underline_color = green;
+        // The popup is replaced rather than patched when its terminal changes.
+        let mut replaced = next.clone();
+        replaced.surface_revision += 1;
+        replaced.popup.as_mut().unwrap().terminal_id = "replacement".into();
+        replaced.popup.as_mut().unwrap().frame.cells[9].underline_color = red;
+
+        let mut decoder = crate::protocol::surface_reuse::Decoder::new(true, false)
+            .with_surface_codec(SurfaceCodec::V2);
+        decoder
+            .decode(ServerMessage::PaneSurface(last.clone()))
+            .unwrap();
+        for (base, target) in [(&last, &next), (&next, &replaced)] {
+            let update = message(
+                base,
+                &mut ServerMessage::PaneSurface(target.clone()),
+                SurfaceCodec::V2,
+            )
+            .unwrap()
+            .expect("smaller delta");
+            let v1 = message(
+                base,
+                &mut ServerMessage::PaneSurface(target.clone()),
+                SurfaceCodec::V1,
+            )
+            .unwrap()
+            .expect("smaller delta");
+            let ServerMessage::EndpointControl { data, .. } = &update else {
+                panic!("delta");
+            };
+            assert!(decode(data).is_err(), "a v1 reader must reject a v2 delta");
+            assert_ne!(update, v1);
+            let ServerMessage::PaneSurface(decoded) = decoder.decode(update).unwrap() else {
+                panic!("full reconstruction");
+            };
+            assert_eq!(&decoded, target);
+        }
+    }
+
+    #[test]
     fn surface_delta_v1_binary_fixture_is_frozen() {
         use sha2::{Digest, Sha256};
         let last = surface();
@@ -504,9 +597,13 @@ mod tests {
         let mut next = last.clone();
         next.surface_revision += 1;
         next.frame.cells[0].symbol = "x".into();
-        let update = message(&last, &mut ServerMessage::PaneSurface(next.clone()))
-            .unwrap()
-            .unwrap();
+        let update = message(
+            &last,
+            &mut ServerMessage::PaneSurface(next.clone()),
+            SurfaceCodec::V1,
+        )
+        .unwrap()
+        .unwrap();
         let mut legacy = crate::protocol::surface_reuse::Decoder::default();
         legacy
             .decode(ServerMessage::PaneSurface(last.clone()))

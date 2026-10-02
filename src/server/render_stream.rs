@@ -4,6 +4,7 @@ use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
 use ratatui::layout::{Position, Rect, Size};
 
 use crate::app::state::AppState;
+use crate::protocol::endpoint::SurfaceCodec;
 use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
 use crate::protocol::{
     CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePatch, RenderEncoding, ServerMessage,
@@ -20,6 +21,7 @@ pub(crate) enum ClientRenderState {
         surface_reuse: bool,
         surface_delta: bool,
         surface_scroll: bool,
+        surface_codec: SurfaceCodec,
         recompute_pending: bool,
     },
     /// Terminal-ANSI clients keep a terminal diff encoder and sequence number.
@@ -39,6 +41,7 @@ impl ClientRenderState {
                 surface_reuse: false,
                 surface_delta: false,
                 surface_scroll: false,
+                surface_codec: SurfaceCodec::V1,
                 recompute_pending: false,
             },
             RenderEncoding::TerminalAnsi => Self::TerminalAnsi {
@@ -64,6 +67,20 @@ impl ClientRenderState {
     pub(crate) fn enable_surface_scroll(&mut self, enabled: bool) {
         if let Self::Semantic { surface_scroll, .. } = self {
             *surface_scroll = enabled;
+        }
+    }
+
+    pub(crate) fn set_surface_codec(&mut self, codec: SurfaceCodec) {
+        if let Self::Semantic { surface_codec, .. } = self {
+            *surface_codec = codec;
+        }
+    }
+
+    /// The pane surface codec this client negotiated; terminal clients have only v1.
+    pub(crate) fn surface_codec(&self) -> SurfaceCodec {
+        match self {
+            Self::Semantic { surface_codec, .. } => *surface_codec,
+            Self::TerminalAnsi { .. } => SurfaceCodec::V1,
         }
     }
 
@@ -178,6 +195,7 @@ impl ClientRenderState {
             surface_revision,
             surface_reuse,
             surface_delta,
+            surface_codec,
             recompute_pending,
             ..
         } = self
@@ -209,7 +227,7 @@ impl ClientRenderState {
             .then_some(last_surface.as_deref())
             .flatten()
             .and_then(|last| {
-                crate::protocol::surface_delta::message(last, &mut message)
+                crate::protocol::surface_delta::message(last, &mut message, *surface_codec)
                     .map_err(|error| tracing::warn!(%error, "failed to encode surface delta"))
                     .ok()
                     .flatten()
@@ -220,6 +238,7 @@ impl ClientRenderState {
                 .flatten()
                 .filter(|last| {
                     last.boot_id == surface.boot_id
+                        // Compares underline colors too, so reuse never hides a color change.
                         && last.frame == surface.frame
                         // Popup cells are not part of the reusable grid; keep their compact codec.
                         && surface.popup.is_none()
@@ -249,6 +268,7 @@ impl ClientRenderState {
             last_surface,
             surface_revision,
             surface_scroll,
+            surface_codec,
             ..
         } = self
         else {
@@ -267,7 +287,7 @@ impl ClientRenderState {
         let next_revision = surface_revision.saturating_add(1);
         patch.surface_revision = next_revision;
         let scrolled = (*surface_scroll)
-            .then(|| crate::protocol::surface_scroll::message(last, &patch))
+            .then(|| crate::protocol::surface_scroll::message(last, &patch, *surface_codec))
             .flatten();
         Some(match scrolled {
             Some(message) => PreparedRender::SemanticPatch {
@@ -636,6 +656,58 @@ mod tests {
             })),
             graphics: crate::protocol::SurfaceGraphicsScene::default(),
         }
+    }
+
+    #[test]
+    fn surface_reuse_v2_keeps_underline_colors_and_resends_a_color_change() {
+        let over_v2_wire = |message: &ServerMessage| {
+            let mut bytes = Vec::new();
+            crate::protocol::write_server_message(&mut bytes, message, SurfaceCodec::V2).unwrap();
+            crate::protocol::read_server_message(
+                &mut bytes.as_slice(),
+                crate::protocol::MAX_FRAME_SIZE,
+                SurfaceCodec::V2,
+            )
+            .unwrap()
+        };
+        let mut state = ClientRenderState::new(RenderEncoding::SemanticFrame);
+        state.set_surface_codec(SurfaceCodec::V2);
+        state.enable_surface_reuse(true);
+        let mut decoder =
+            crate::protocol::surface_reuse::Decoder::default().with_surface_codec(SurfaceCodec::V2);
+        let mut surface = popup_surface("popup");
+        surface.popup = None;
+        surface.frame.cells[1].underline_color =
+            crate::protocol::color_to_u32(ratatui::style::Color::Rgb(255, 0, 0));
+        let initial = state.prepare_pane_surface(surface.clone()).unwrap();
+        decoder.decode(over_v2_wire(initial.message())).unwrap();
+        state.commit_sent_frame(initial);
+
+        surface.projection_revision += 1;
+        let reused = state.prepare_pane_surface(surface.clone()).unwrap();
+        assert!(
+            matches!(reused.message(), ServerMessage::EndpointControl { kind, .. }
+            if kind == crate::protocol::surface_reuse::MESSAGE_KIND)
+        );
+        let ServerMessage::PaneSurface(decoded) =
+            decoder.decode(over_v2_wire(reused.message())).unwrap()
+        else {
+            panic!("decoded reused surface");
+        };
+        assert_eq!(decoded.frame, surface.frame);
+        state.commit_sent_frame(reused);
+
+        surface.projection_revision += 1;
+        surface.frame.cells[1].underline_color =
+            crate::protocol::color_to_u32(ratatui::style::Color::Rgb(0, 255, 0));
+        let changed = state.prepare_pane_surface(surface.clone()).unwrap();
+        assert!(matches!(changed.message(), ServerMessage::PaneSurface(_)));
+        let ServerMessage::PaneSurface(decoded) =
+            decoder.decode(over_v2_wire(changed.message())).unwrap()
+        else {
+            panic!("decoded changed surface");
+        };
+        assert_eq!(decoded.frame, surface.frame);
     }
 
     #[test]

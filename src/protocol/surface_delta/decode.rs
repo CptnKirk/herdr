@@ -13,11 +13,12 @@ use bincode::{
 };
 
 use super::{GridUpdate, SurfaceDelta};
+use crate::protocol::endpoint::SurfaceCodec;
 use crate::protocol::{
     CellData, ClientShellPopupSurface, CursorState, FrameData, PaneSurfaceFrame, PaneSurfacePane,
     PaneSurfacePatchRow, PaneSurfaceSplit, PaneSurfaceSplitDirection, SurfaceGraphicsAsset,
     SurfaceGraphicsAssetKey, SurfaceGraphicsPlacement, SurfaceGraphicsScene, SurfaceRect,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
+    UnderlineColorTrailer, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
 };
 
 // These are intentionally practical protocol limits rather than bincode byte
@@ -43,6 +44,7 @@ struct Decoded(SurfaceDelta<PaneSurfaceFrame>);
 pub(super) fn decode(
     data: &str,
     expected: Option<(u16, u16)>,
+    codec: SurfaceCodec,
 ) -> Result<SurfaceDelta<PaneSurfaceFrame>, String> {
     // EndpointControl's data string itself is subject to the outer graphics
     // frame cap. Checking before base64 decoding also bounds that allocation.
@@ -55,7 +57,7 @@ pub(super) fn decode(
     if bytes.len() > MAX_GRAPHICS_FRAME_SIZE {
         return Err("decoded surface delta exceeds the frame limit".into());
     }
-    decode_bytes_with_data_len(&bytes, expected, data.len())
+    decode_bytes_with_data_len(&bytes, expected, data.len(), codec)
 }
 
 #[cfg(test)]
@@ -64,21 +66,42 @@ fn decode_bytes(
     expected: Option<(u16, u16)>,
 ) -> Result<SurfaceDelta<PaneSurfaceFrame>, String> {
     let data_len = base64::encoded_len(bytes.len(), false).unwrap_or(usize::MAX);
-    decode_bytes_with_data_len(bytes, expected, data_len)
+    decode_bytes_with_data_len(bytes, expected, data_len, SurfaceCodec::V1)
 }
 
 fn decode_bytes_with_data_len(
     bytes: &[u8],
     expected: Option<(u16, u16)>,
     data_len: usize,
+    codec: SurfaceCodec,
 ) -> Result<SurfaceDelta<PaneSurfaceFrame>, String> {
     let context = DecodeContext { expected, data_len };
-    let (Decoded(delta), consumed) = bincode::decode_from_slice_with_context(
+    let (Decoded(mut delta), mut consumed) = bincode::decode_from_slice_with_context(
         bytes,
         bincode::config::standard().with_limit::<MAX_GRAPHICS_FRAME_SIZE>(),
         context,
     )
     .map_err(|error| error.to_string())?;
+    if codec == SurfaceCodec::V2 {
+        let (trailer, trailer_len) =
+            UnderlineColorTrailer::decode(&bytes[consumed..]).map_err(|error| error.to_string())?;
+        let (popup, popup_grid): (&mut [PaneSurfacePatchRow], &mut [CellData]) =
+            match &mut delta.popup_cells {
+                Some(GridUpdate::Patch(rows)) => (rows, &mut []),
+                Some(GridUpdate::Replace(cells)) => (&mut [], cells),
+                None => (&mut [], &mut []),
+            };
+        trailer
+            .apply_to(
+                delta.rows.iter_mut().flat_map(|row| row.cells.iter_mut()),
+                popup
+                    .iter_mut()
+                    .flat_map(|row| row.cells.iter_mut())
+                    .chain(popup_grid),
+            )
+            .map_err(|error| error.to_string())?;
+        consumed += trailer_len;
+    }
     if consumed != bytes.len() {
         return Err("trailing surface delta bytes".into());
     }
@@ -540,7 +563,13 @@ mod tests {
             popup_cells: None::<GridUpdate>,
         };
         let bytes = encoded(&ordinary);
-        assert!(decode_bytes_with_data_len(&bytes, Some((1, 1)), MAX_FRAME_SIZE + 1).is_err());
+        assert!(decode_bytes_with_data_len(
+            &bytes,
+            Some((1, 1)),
+            MAX_FRAME_SIZE + 1,
+            SurfaceCodec::V1
+        )
+        .is_err());
 
         let mut graphics = surface(1, 1);
         graphics.graphics.retained_assets.push(graphics_key());
@@ -552,7 +581,13 @@ mod tests {
             popup_cells: None::<GridUpdate>,
         };
         let bytes = encoded(&delta);
-        assert!(decode_bytes_with_data_len(&bytes, Some((1, 1)), MAX_FRAME_SIZE + 1).is_ok());
+        assert!(decode_bytes_with_data_len(
+            &bytes,
+            Some((1, 1)),
+            MAX_FRAME_SIZE + 1,
+            SurfaceCodec::V1
+        )
+        .is_ok());
     }
 
     #[test]
