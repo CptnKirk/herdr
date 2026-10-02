@@ -535,23 +535,26 @@ impl HeadlessServer {
             } else {
                 protocol::MAX_FRAME_SIZE
             };
-            let mut serialized =
-                match Self::frame_server_message_with_max(prepared.message(), max_frame_size) {
-                    Ok(serialized) => serialized,
-                    Err(error) => {
-                        warn!(
-                            client_id,
-                            %error,
-                            "failed to serialize retained pane surface patch"
-                        );
-                        // A delta may own an encoded graphics payload that cannot be
-                        // trimmed in place. Force the bounded full-surface recovery path.
-                        client.render_state.request_repaint();
-                        client.defer_full_render();
-                        deferred += 1;
-                        continue;
-                    }
-                };
+            let mut serialized = match Self::frame_client_message_with_max(
+                prepared.message(),
+                client.render_state.surface_codec(),
+                max_frame_size,
+            ) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    warn!(
+                        client_id,
+                        %error,
+                        "failed to serialize retained pane surface patch"
+                    );
+                    // A delta may own an encoded graphics payload that cannot be
+                    // trimmed in place. Force the bounded full-surface recovery path.
+                    client.render_state.request_repaint();
+                    client.defer_full_render();
+                    deferred += 1;
+                    continue;
+                }
+            };
             if let Some((_, message)) = &native_upload {
                 let Ok(file_frame) =
                     Self::frame_server_message_with_max(message, MAX_GRAPHICS_FRAME_SIZE)

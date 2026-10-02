@@ -1573,8 +1573,21 @@ impl HeadlessServer {
         msg: &ServerMessage,
         max_frame_size: usize,
     ) -> Result<Vec<u8>, protocol::FramingError> {
+        Self::frame_client_message_with_max(
+            msg,
+            protocol::endpoint::SurfaceCodec::V1,
+            max_frame_size,
+        )
+    }
+
+    /// Encodes a server message in one client's negotiated pane surface codec.
+    fn frame_client_message_with_max(
+        msg: &ServerMessage,
+        surface_codec: protocol::endpoint::SurfaceCodec,
+        max_frame_size: usize,
+    ) -> Result<Vec<u8>, protocol::FramingError> {
         let mut framed = Vec::new();
-        protocol::write_message(&mut framed, msg)?;
+        protocol::write_server_message(&mut framed, msg, surface_codec)?;
         let payload_len = framed.len().saturating_sub(4);
         if payload_len > max_frame_size {
             return Err(protocol::FramingError::Oversized {
@@ -1910,6 +1923,7 @@ impl HeadlessServer {
                 surface_reuse,
                 surface_delta,
                 surface_scroll,
+                surface_codec,
                 writer,
             } => {
                 if self.handoff_in_progress {
@@ -1960,6 +1974,7 @@ impl HeadlessServer {
                 connection
                     .render_state
                     .enable_surface_scroll(surface_scroll);
+                connection.render_state.set_surface_codec(surface_codec);
                 connection.shell_projection_revision = 1;
                 let config_diagnostic = if endpoint_keybindings {
                     self.server_config_diagnostic.as_deref()

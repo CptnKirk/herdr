@@ -1,5 +1,6 @@
 //! Optional endpoint encoding that retains unchanged terminal cells across projections.
 
+use super::endpoint::SurfaceCodec;
 use super::{CellData, PaneSurfaceFrame, ServerMessage};
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,7 @@ pub(crate) struct Decoder {
     baseline: Option<CellBaseline>,
     surface_delta: bool,
     surface_scroll: bool,
+    surface_codec: SurfaceCodec,
 }
 
 impl Decoder {
@@ -94,7 +96,13 @@ impl Decoder {
             baseline: None,
             surface_delta,
             surface_scroll,
+            surface_codec: SurfaceCodec::V1,
         }
+    }
+
+    pub(crate) fn with_surface_codec(mut self, surface_codec: SurfaceCodec) -> Self {
+        self.surface_codec = surface_codec;
+        self
     }
 
     pub(crate) fn decode(&mut self, message: ServerMessage) -> Result<ServerMessage, String> {
@@ -186,7 +194,7 @@ impl Decoder {
         let Some(base) = &mut self.baseline else {
             return Err("surface scroll without a baseline".into());
         };
-        let scroll = super::surface_scroll::decode(data)?;
+        let scroll = super::surface_scroll::decode(data, self.surface_codec)?;
         if !base.matches_patch(&scroll.patch) {
             return Err("surface scroll does not match its baseline".into());
         }
@@ -200,7 +208,7 @@ impl Decoder {
         let Some(base) = &mut self.baseline else {
             return Err("surface delta without a baseline".into());
         };
-        let delta = surface_delta::decode_for(data, (base.width, base.height))?;
+        let delta = surface_delta::decode_for(data, (base.width, base.height), self.surface_codec)?;
         let mut surface = delta.surface;
         if surface.boot_id != base.boot_id
             || delta.base_projection_revision != base.projection_revision

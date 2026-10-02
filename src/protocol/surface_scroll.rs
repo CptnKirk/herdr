@@ -7,6 +7,7 @@
 
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 
+use super::endpoint::SurfaceCodec;
 use super::{
     CellData, FrameData, PaneSurfaceFrame, PaneSurfacePatch, PaneSurfacePatchRow, ServerMessage,
     SurfaceRect, MAX_FRAME_SIZE,
@@ -18,6 +19,7 @@ pub(crate) const MESSAGE_KIND: &str = "endpoint.surface-scroll.v1";
 // This byte layout is frozen with MESSAGE_KIND: one count byte, then per
 // scroll x, y, width, height (u16 LE) and shift (i16 LE), then one framed
 // `ServerMessage::PaneSurfacePatch` decoded by the shared bounded reader.
+// Under `shell.surface.v2` that frame is a v2 patch, underline colors included.
 const MAX_SCROLLS: usize = 64;
 const SCROLL_BYTES: usize = 10;
 
@@ -273,7 +275,11 @@ fn encoded_size(value: &impl serde::Serialize) -> Option<usize> {
 /// Encodes `patch` against the committed `last` surface as a scroll message
 /// when some pane's shift at least halves its patched cells. Returns `None`
 /// otherwise, so ordinary edits never pay for the wrapper.
-pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Option<ServerMessage> {
+pub(crate) fn message(
+    last: &PaneSurfaceFrame,
+    patch: &PaneSurfacePatch,
+    codec: SurfaceCodec,
+) -> Option<ServerMessage> {
     let frame = &last.frame;
     if frame.cells.len() != usize::from(frame.width) * usize::from(frame.height) {
         return None;
@@ -330,7 +336,7 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
         }
         bytes.extend_from_slice(&scroll.shift.to_le_bytes());
     }
-    super::write_message(&mut bytes, &inner).ok()?;
+    super::write_server_message(&mut bytes, &inner, codec).ok()?;
     let message = ServerMessage::EndpointControl {
         kind: MESSAGE_KIND.into(),
         data: STANDARD_NO_PAD.encode(bytes),
@@ -340,7 +346,7 @@ pub(crate) fn message(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> Opti
 
 /// Decodes one scroll message. Geometry is validated against the receiver's
 /// baseline by [`apply`], never trusted here.
-pub(crate) fn decode(data: &str) -> Result<ScrollPatch, String> {
+pub(crate) fn decode(data: &str, codec: SurfaceCodec) -> Result<ScrollPatch, String> {
     let limit = base64::encoded_len(MAX_FRAME_SIZE, false).unwrap_or(usize::MAX);
     if data.len() > limit {
         return Err("surface scroll exceeds the frame limit".into());
@@ -372,7 +378,7 @@ pub(crate) fn decode(data: &str) -> Result<ScrollPatch, String> {
         })
         .collect();
     let mut frame = &bytes[header..];
-    let decoded = super::read_message::<_, ServerMessage>(&mut frame, MAX_FRAME_SIZE);
+    let decoded = super::read_server_message(&mut frame, MAX_FRAME_SIZE, codec);
     if !frame.is_empty() {
         return Err("surface scroll has trailing bytes".into());
     }
@@ -579,14 +585,20 @@ mod tests {
     }
 
     fn round_trip(last: &PaneSurfaceFrame, patch: &PaneSurfacePatch) -> (usize, FrameData) {
-        let message = message(last, patch).expect("scroll message");
+        let message = message(last, patch, SurfaceCodec::V1).expect("scroll message");
         let size = encoded_size(&message).unwrap();
         let ServerMessage::EndpointControl { kind, data } = message else {
             panic!("scroll must be an endpoint control frame");
         };
         assert_eq!(kind, MESSAGE_KIND);
         let mut cells = last.frame.cells.clone();
-        let expanded = apply(&mut cells, WIDTH, HEIGHT, decode(&data).unwrap()).unwrap();
+        let expanded = apply(
+            &mut cells,
+            WIDTH,
+            HEIGHT,
+            decode(&data, SurfaceCodec::V1).unwrap(),
+        )
+        .unwrap();
         // A receiver without scroll support must reach the same grid.
         let mut plain = last.frame.clone();
         for row in &expanded.rows {
@@ -649,6 +661,49 @@ mod tests {
     }
 
     #[test]
+    fn surface_codec_v2_scroll_carries_underline_colors() {
+        // Each line keeps its color as it moves; one row's color changes in place.
+        let color = |n: i32| 0x02_00_00_00 | (n as u32 + 1);
+        let color_line = |frame: &mut FrameData, y: u16, n: i32| {
+            write(frame, y, &line(n));
+            let start = usize::from(PANE.y + y) * usize::from(WIDTH) + usize::from(PANE.x);
+            frame.cells[start].underline_color = color(n);
+        };
+        let mut last = surface();
+        for y in 0..PANE.height {
+            color_line(&mut last.frame, y, i32::from(y));
+        }
+        let mut next = last.frame.clone();
+        for y in 0..PANE.height {
+            color_line(&mut next, y, i32::from(y) + 1);
+        }
+        let recolored = usize::from(PANE.y + 4) * usize::from(WIDTH) + usize::from(PANE.x);
+        next.cells[recolored].underline_color = 0x01_00_00_C4;
+        let patch = row_patch(&last, &next);
+
+        let message = message(&last, &patch, SurfaceCodec::V2).expect("scroll message");
+        let ServerMessage::EndpointControl { data, .. } = message else {
+            panic!("scroll must be an endpoint control frame");
+        };
+        assert!(decode(&data, SurfaceCodec::V1).is_err());
+        let mut cells = last.frame.cells.clone();
+        let expanded = apply(
+            &mut cells,
+            WIDTH,
+            HEIGHT,
+            decode(&data, SurfaceCodec::V2).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cells, next.cells);
+        let mut plain = last.frame.clone();
+        for row in &expanded.rows {
+            let start = usize::from(row.y) * usize::from(WIDTH) + usize::from(row.x);
+            plain.cells[start..start + row.cells.len()].clone_from_slice(&row.cells);
+        }
+        assert_eq!(plain.cells, next.cells);
+    }
+
+    #[test]
     fn reverse_scroll_and_edits_reach_the_same_grid() {
         let last = surface();
         let mut next = last.frame.clone();
@@ -665,7 +720,7 @@ mod tests {
         let last = surface();
         let mut next = last.frame.clone();
         write(&mut next, 9, "typed");
-        assert!(message(&last, &row_patch(&last, &next)).is_none());
+        assert!(message(&last, &row_patch(&last, &next), SurfaceCodec::V1).is_none());
     }
 
     #[test]
@@ -675,7 +730,7 @@ mod tests {
         for y in 0..PANE.height {
             write(&mut next, y, &format!("other {y}"));
         }
-        assert!(message(&last, &row_patch(&last, &next)).is_none());
+        assert!(message(&last, &row_patch(&last, &next), SurfaceCodec::V1).is_none());
     }
 
     #[test]
@@ -686,12 +741,12 @@ mod tests {
             write(&mut next, y, &line(i32::from(y) + 1));
         }
         let Some(ServerMessage::EndpointControl { data, .. }) =
-            message(&last, &row_patch(&last, &next))
+            message(&last, &row_patch(&last, &next), SurfaceCodec::V1)
         else {
             panic!("scroll message");
         };
         let mut cells = last.frame.cells.clone();
-        let mut decoded = decode(&data).unwrap();
+        let mut decoded = decode(&data, SurfaceCodec::V1).unwrap();
         decoded.scrolls[0].rect.height = HEIGHT;
         assert!(apply(&mut cells, WIDTH, HEIGHT, decoded).is_err());
         assert_eq!(
@@ -699,7 +754,7 @@ mod tests {
             "a rejected scroll must not touch the grid"
         );
 
-        let mut decoded = decode(&data).unwrap();
+        let mut decoded = decode(&data, SurfaceCodec::V1).unwrap();
         decoded.scrolls.push(decoded.scrolls[0]);
         assert!(
             apply(&mut cells, WIDTH, HEIGHT, decoded).is_err(),
@@ -707,14 +762,14 @@ mod tests {
         );
         assert_eq!(cells, last.frame.cells);
 
-        let mut decoded = decode(&data).unwrap();
+        let mut decoded = decode(&data, SurfaceCodec::V1).unwrap();
         decoded.scrolls[0].shift = PANE.height as i16;
         assert!(apply(&mut cells, WIDTH, HEIGHT, decoded).is_err());
         let mut trailing = STANDARD_NO_PAD.decode(&data).unwrap();
         trailing.push(0);
-        assert!(decode(&STANDARD_NO_PAD.encode(trailing)).is_err());
-        assert!(decode("").is_err());
-        assert!(decode(&STANDARD_NO_PAD.encode([0u8])).is_err());
-        assert!(decode(&STANDARD_NO_PAD.encode([1u8, 0, 0])).is_err());
+        assert!(decode(&STANDARD_NO_PAD.encode(trailing), SurfaceCodec::V1).is_err());
+        assert!(decode("", SurfaceCodec::V1).is_err());
+        assert!(decode(&STANDARD_NO_PAD.encode([0u8]), SurfaceCodec::V1).is_err());
+        assert!(decode(&STANDARD_NO_PAD.encode([1u8, 0, 0]), SurfaceCodec::V1).is_err());
     }
 }

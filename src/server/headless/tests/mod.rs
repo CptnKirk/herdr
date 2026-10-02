@@ -12,6 +12,8 @@ mod surface_delta_tests;
 mod surface_interest_tests;
 #[path = "surface_scroll.rs"]
 mod surface_scroll_tests;
+#[path = "underline_color.rs"]
+mod underline_color_tests;
 
 fn client_shell_projection(
     receiver: &std::sync::mpsc::Receiver<Vec<u8>>,
@@ -739,6 +741,7 @@ async fn client_shell_attach_seeds_workspace() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -772,6 +775,7 @@ async fn completion_guard_endpoint_pairs_runtime_completions_with_snapshots() {
         surface_reuse: false,
         surface_delta: false,
         surface_scroll: false,
+        surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
         writer,
     });
     let (_, initial) = client_shell_projection(&control_rx);
@@ -831,6 +835,7 @@ async fn client_shell_endpoint_request_uses_the_selected_connection() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -940,6 +945,7 @@ async fn client_shell_pairs_agent_view_set_replacement_and_clear_with_snapshots(
             surface_reuse: false,
             surface_delta: false,
             surface_scroll: false,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             client_id: 77,
             surface_cols: 80,
             surface_rows: 23,
@@ -1053,6 +1059,7 @@ async fn client_shell_receives_metadata_then_shell_free_pane_surface() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -1221,6 +1228,7 @@ fn connect_test_shell(
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -1826,6 +1834,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer: local_writer,
         })
     );
@@ -1851,6 +1860,7 @@ async fn client_shell_config_diagnostics_follow_keybinding_ownership() {
             endpoint_keybindings: true,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer: endpoint_writer,
         })
     );
@@ -2771,6 +2781,7 @@ async fn public_api_focus_replaces_every_client_shell_projection() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
@@ -3018,6 +3029,7 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
             endpoint_keybindings: false,
             mouse_capture: false,
             surface_active: true,
+            surface_codec: crate::protocol::endpoint::SurfaceCodec::V1,
             writer,
         })
     );
