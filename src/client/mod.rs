@@ -152,7 +152,10 @@ fn negotiated_surface_decoder(
     let reuse = negotiation.supports_capability(protocol::surface_reuse::CAPABILITY);
     let delta = negotiation.supports_capability(protocol::surface_delta::CAPABILITY);
     let scroll = negotiation.supports_capability(protocol::surface_scroll::CAPABILITY);
-    (reuse || delta || scroll).then(|| protocol::surface_reuse::Decoder::new(delta, scroll))
+    (reuse || delta || scroll).then(|| {
+        protocol::surface_reuse::Decoder::new(delta, scroll)
+            .with_surface_codec(negotiation.surface_codec())
+    })
 }
 
 fn run_client_with_mode(
@@ -596,7 +599,8 @@ async fn run_client_loop(
         let negotiation = endpoint::EndpointNegotiation::new(
             handshake.endpoint_methods.unwrap_or_default(),
             handshake.endpoint_capabilities.unwrap_or_default(),
-        );
+        )
+        .with_surface_codec(handshake.surface_codec);
         let surface_decoder = negotiated_surface_decoder(&negotiation);
         let transport = start_endpoint_transport(
             stream,
@@ -605,6 +609,7 @@ async fn run_client_loop(
             endpoint::ClientEndpointId::Local,
             1,
             max_frame_size,
+            negotiation.surface_codec(),
             surface_decoder,
         )?;
         let mut registry = endpoint::EndpointRegistry::new(transport, 1, negotiation);
@@ -1306,6 +1311,7 @@ async fn run_client_loop(
                     let reader_quit = writer.stop_handle();
                     #[cfg(unix)]
                     state.start_endpoint_graphics_generation(&endpoint_id, generation);
+                    let surface_codec = negotiation.surface_codec();
                     write_stream.insert(
                         endpoint_id.clone(),
                         writer,
@@ -1323,6 +1329,7 @@ async fn run_client_loop(
                             reader_tx,
                             &reader_quit,
                             MAX_GRAPHICS_FRAME_SIZE,
+                            surface_codec,
                             endpoint_id,
                             generation,
                             surface_decoder,

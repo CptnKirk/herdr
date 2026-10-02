@@ -803,8 +803,12 @@ impl HeadlessServer {
             let mut shell_assets_deferred = false;
             let mut suppress_impossible_asset_retry = false;
             let mut stripped_assets = Vec::new();
-            let mut serialized = match Self::frame_server_message_with_max(prepared.message(), max)
-            {
+            let surface_codec = client.render_state.surface_codec();
+            let mut serialized = match Self::frame_client_message_with_max(
+                prepared.message(),
+                surface_codec,
+                max,
+            ) {
                 Ok(frame) => frame,
                 Err(protocol::FramingError::Oversized { claimed, max }) if has_graphics => {
                     warn!(
@@ -816,7 +820,11 @@ impl HeadlessServer {
                             break None;
                         };
                         stripped_assets.push(key);
-                        match Self::frame_server_message_with_max(prepared.message(), max) {
+                        match Self::frame_client_message_with_max(
+                            prepared.message(),
+                            surface_codec,
+                            max,
+                        ) {
                             Ok(framed) => break Some(framed),
                             Err(protocol::FramingError::Oversized { .. }) => {}
                             Err(err) => {
