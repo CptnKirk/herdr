@@ -961,3 +961,113 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
     assert_eq!(direction, AttachScrollDirection::Up);
     assert_eq!(lines, 3);
 }
+
+#[cfg(unix)]
+#[test]
+fn shell_client_shows_underline_colors_from_full_surfaces_and_deltas() {
+    use crate::protocol::{FrameData, PaneSurfaceFrame, MAX_FRAME_SIZE};
+    use crate::server::client_transport::{handle_client_handshake, ServerEvent};
+    use interprocess::local_socket::traits::Listener as _;
+    use ratatui::{buffer::Buffer, layout::Rect, style::Color};
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path =
+        std::path::PathBuf::from("/tmp").join(format!("h{}-{nanos}.sock", std::process::id()));
+    let listener = crate::ipc::bind_local_listener(&path).unwrap();
+    let mut client_stream = crate::ipc::connect_local_stream(&path).unwrap();
+    let server_stream = listener.accept().unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    let (server_tx, mut server_rx) = tokio::sync::mpsc::channel(4);
+    let server_quit = Arc::new(AtomicBool::new(false));
+    let handshake_quit = server_quit.clone();
+    let server = std::thread::spawn(move || {
+        handle_client_handshake(server_stream, 1, &server_tx, &handshake_quit)
+    });
+    let negotiation =
+        handshake::probe_endpoint_negotiation(&mut client_stream).expect("client handshake");
+    let Some(ServerEvent::ClientShellConnected {
+        surface_codec,
+        writer,
+        ..
+    }) = server_rx.blocking_recv()
+    else {
+        panic!("expected ClientShellConnected");
+    };
+
+    // The server sends what it negotiated: a full surface, then a delta over it.
+    let red = protocol::color_to_u32(Color::Rgb(255, 0, 0));
+    let green = protocol::color_to_u32(Color::Rgb(0, 255, 0));
+    let mut first = PaneSurfaceFrame {
+        boot_id: "boot".into(),
+        projection_revision: 1,
+        surface_revision: 1,
+        frame: FrameData::from_ratatui_buffer(&Buffer::empty(Rect::new(0, 0, 40, 10)), None),
+        panes: Vec::new(),
+        splits: Vec::new(),
+        popup: None,
+        graphics: Default::default(),
+    };
+    first.frame.cells[1].underline_color = red;
+    let mut next = first.clone();
+    next.surface_revision += 1;
+    next.frame.cells[2].underline_color = green;
+    let delta = protocol::surface_delta::message(
+        &first,
+        &mut ServerMessage::PaneSurface(next.clone()),
+        surface_codec,
+    )
+    .unwrap()
+    .expect("smaller delta");
+    for message in [ServerMessage::PaneSurface(first.clone()), delta] {
+        let mut bytes = Vec::new();
+        protocol::write_server_message(&mut bytes, &message, surface_codec).unwrap();
+        writer.control.send(bytes).unwrap();
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+    let reader_quit = Arc::new(AtomicBool::new(false));
+    let reader_stop = reader_quit.clone();
+    let reader_codec = negotiation.surface_codec();
+    let decoder = negotiated_surface_decoder(&negotiation);
+    let reader = std::thread::spawn(move || {
+        server_reader_thread(
+            client_stream,
+            event_tx,
+            &reader_stop,
+            MAX_FRAME_SIZE,
+            reader_codec,
+            endpoint::ClientEndpointId::Local,
+            1,
+            decoder,
+        )
+    });
+    let mut shown = Vec::new();
+    for sent in ["full surface", "delta"] {
+        match event_rx.blocking_recv() {
+            Some(ClientLoopEvent::ServerMessage { message, .. }) => match *message {
+                ServerMessage::PaneSurface(surface) => shown.push(surface),
+                other => panic!("expected a pane surface, got {other:?}"),
+            },
+            Some(ClientLoopEvent::ServerDisconnected { .. }) => {
+                panic!("the client could not read the server's {sent}")
+            }
+            _ => panic!("expected a server message"),
+        }
+    }
+    assert_eq!(shown[0].frame.cells[1].underline_color, red);
+    assert_eq!(shown[1].frame.cells[2].underline_color, green);
+    assert_eq!(shown[1], next);
+
+    reader_quit.store(true, Ordering::Release);
+    reader.join().expect("reader thread join");
+    drop(writer);
+    server_quit.store(true, Ordering::Release);
+    server
+        .join()
+        .expect("handshake thread join")
+        .expect("handshake thread result");
+}
