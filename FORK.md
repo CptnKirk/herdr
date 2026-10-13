@@ -45,8 +45,9 @@ is not added to v1. This branch adds a second surface codec, `shell.surface.v2`:
 
 ### The optional surface encodings
 
-Since 0.9.0, upstream can also send pane cells through three optional
-encodings that a client turns on with capabilities in its hello. Under v2 each
+Since 0.9.1 (reuse and delta) and 0.9.2 (scroll), upstream can also send pane
+cells through three optional encodings that a client turns on with
+capabilities in its hello. Under v2 each
 of them carries the color too:
 
 - `surface_delta` sends only the changed spans of a recomputed surface, inside
@@ -65,9 +66,12 @@ of them carries the color too:
 
 For shell clients, which receive pane surfaces:
 
-- Stock client, this server: the client offers only v1 and receives the same
-  surface, delta and scroll bytes a stock server sends. It works; underline
-  colors are not shown.
+- Stock client, this server: the client offers only v1, and every surface,
+  patch, delta and scroll frame it receives is a v1 frame. It works; underline
+  colors are not shown. This server counts a cell whose only change is its
+  underline color as changed, so for such a cell it may send a patch, delta or
+  full surface where a stock server sends nothing or a reuse. The client draws
+  the same screen either way; only the bytes differ.
 - This client, stock server: the server answers v1, which this client accepts.
   It works; underline colors are not shown.
 - This client and this server: v2, with underline colors.
@@ -114,7 +118,9 @@ repository is needed.
 ## Changes versus the 0.9.3 fork
 
 The 0.9.3 fork (branch `fix/underline-color-wire-0.9.3`) applied to v0.9.4
-without conflicts, and its code is unchanged here.
+without conflicts, and its code is unchanged here except for one line in a
+test that is new in v0.9.4: that test builds the client-connect event by hand,
+so it now names the surface codec (v1).
 
 - v0.9.4 adds no new way to send pane cells to a client. The framing calls,
   the places that build cells and the two cell comparisons are the same as in
