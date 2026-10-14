@@ -1,6 +1,6 @@
-# herdr 0.9.4 with underline colors
+# herdr 0.9.5 with underline colors
 
-This branch is herdr v0.9.4 plus a fix for
+This branch is herdr v0.9.5 plus a fix for
 [herdrdev/herdr#1178](https://github.com/herdrdev/herdr/issues/1178): underline
 colors (SGR 58) are dropped between a pane and the attached client. An
 undercurl drawn by Neovim, a spell checker or an LSP shows up in the text's own
@@ -14,9 +14,9 @@ In a pane, run:
 printf '\e[4:3m\e[58:2::255:0:0mX\e[0m\n'
 ```
 
-On stock 0.9.4 the `X` gets a curly underline drawn in the foreground color. On
+On stock 0.9.5 the `X` gets a curly underline drawn in the foreground color. On
 this branch the underline is red. `herdr pane read <pane> --format ansi` shows
-the color is already in the server's terminal state on stock 0.9.4; it is lost
+the color is already in the server's terminal state on stock 0.9.5; it is lost
 on the way to the client.
 
 ## How the color is carried
@@ -62,7 +62,7 @@ of them carries the color too:
   cells equal the last ones sent, and that comparison includes underline
   colors, so a color change always goes out on a path that carries it.
 
-## Compatibility with stock 0.9.4
+## Compatibility with stock 0.9.5
 
 For shell clients, which receive pane surfaces:
 
@@ -83,7 +83,7 @@ format is unchanged; only the ANSI inside it gains the color.
 
 ## Build
 
-herdr 0.9.4's vendored libghostty-vt needs Zig 0.16.0:
+herdr 0.9.5's vendored libghostty-vt needs Zig 0.16.0:
 `vendor/libghostty-vt/build.zig.zon` sets `minimum_zig_version = "0.16.0"`.
 This branch was built and tested with 0.16.0 only. If the `zig` on your `PATH`
 is another version, point the build at a 0.16.0 binary without changing `PATH`;
@@ -112,10 +112,27 @@ client's render state, not the whole server, in
 `surface_reuse_v2_keeps_underline_colors_and_resends_a_color_change`. The
 client's own drawing has tests in `render_ansi.rs`: two neighbouring cells that
 differ only in underline color both get their color, and a cell whose only
-change is its color (set, changed or cleared) is redrawn. Nothing outside the
-repository is needed.
+change is its color (set, changed or cleared) is redrawn. The client's side of
+the codec has its own test in `src/client/tests/mod.rs`
+(`shell_client_shows_underline_colors_from_full_surfaces_and_deltas`): a shell
+client handshakes with the real server and must read the colors from a full
+surface and a delta. Nothing outside the repository is needed.
 
-## Changes versus the 0.9.3 fork
+## Changes versus the 0.9.4 fork
+
+The 0.9.4 fork (branch `fix/underline-color-wire-0.9.4`) applied to v0.9.5
+without conflicts, and every commit's patch is unchanged (`git range-diff`
+shows each one as identical).
+
+- v0.9.5 changes no file under `src/protocol`, `src/server` or `src/pane`.
+  In `src/client` it changes only input handling and its tests. So it adds no
+  new way to send pane cells to a client.
+- `PROTOCOL_VERSION` (22) and the endpoint generation (1) are unchanged, and
+  v0.9.5 does not change the handoff code, so a 0.9.4-fork peer and a
+  0.9.5-fork peer negotiate `shell.surface.v2` with each other.
+- The build still needs Zig 0.16.0.
+
+## Changes from the 0.9.3 fork to the 0.9.4 fork
 
 The 0.9.3 fork (branch `fix/underline-color-wire-0.9.3`) applied to v0.9.4
 without conflicts, and its code is unchanged here except for one line in a
@@ -154,4 +171,4 @@ parts. Porting it to 0.9.3 changed these things:
 
 The earlier patch for herdr 0.8.x (branch `fix/underline-color-wire`, commit
 `f03d6209`) wrote SGR 58 in the semicolon form, `58;2;r;g;b`; the 0.9.0,
-0.9.3 and 0.9.4 series write the colon form.
+0.9.3, 0.9.4 and 0.9.5 series write the colon form.
